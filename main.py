@@ -1,7 +1,7 @@
 import asyncio
 import sqlite3
 from datetime import datetime
-from config import api_key, admin_password
+from config import api_key, admin_id, admin_password
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -15,6 +15,7 @@ db = 'database.sql'
 
 class Bid(StatesGroup):
     waitingText = State()
+    waitingPhoto = State()
 
 class auth(StatesGroup):
     password = State()
@@ -32,15 +33,22 @@ class closeBidState(StatesGroup):
 
 def DbInit():
     conn = sqlite3.connect(db)
-    conn.execute('CREATE TABLE IF NOT EXISTS bid(id INTEGER PRIMARY KEY AUTOINCREMENT, first_name VARCHAR(20), user_id VARCHAR(20), user_tg_id VARCHAR(20), bid TEXT, status VARCHAR(10))')
+    conn.execute('CREATE TABLE IF NOT EXISTS bid(id INTEGER PRIMARY KEY AUTOINCREMENT, first_name VARCHAR(20), user_id VARCHAR(20), user_tg_id VARCHAR(20), bid TEXT, status VARCHAR(10), photos TEXT)')
     conn.commit()
     conn.close()
 
 def SaveBid(name, username, userId, bid):
     conn = sqlite3.connect(db)
-    conn.execute('INSERT INTO bid(first_name, user_id, user_tg_id, bid, status) VALUES(?, ?, ?, ?, ?)', (name, username, userId, bid, 'active'))
+    cur = conn.cursor()
+    cur.execute('INSERT INTO bid(first_name, user_id, user_tg_id, bid, status) VALUES(?, ?, ?, ?, ?)', (name, username, userId, bid, 'active'))
     conn.commit()
+
+    newId = cur.lastrowid
+
+    cur.close()
     conn.close()
+
+    return newId
 
 def EditBid(bid, userId):
     conn = sqlite3.connect(db)
@@ -106,14 +114,50 @@ async def sumbitRequest(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(Bid.waitingText, F.text)
 async def getBidText(message: types.Message, state: FSMContext):
     markup = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text='Назад', callback_data='back')]
+        [types.InlineKeyboardButton(text='Готово', callback_data='back')]
     ])
 
     user = message.from_user
-    SaveBid(user.first_name, user.username, user.id, message.text)
+    bidId = SaveBid(user.first_name, user.username, user.id, message.text)
+
+    adminMarkup = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text='Ответить', callback_data=f'quickReply_{bidId}')]
+    ])
+
+    try:
+        await bot.send_message(
+            chat_id=admin_id,
+            text=f'Новая заявка №{bidId}\n\nИмя: {user.first_name}\nТег: @{user.username}\n{'-~' * 15}\n\n{message.text}',
+            reply_markup=adminMarkup
+        )
+    except TelegramBadRequest:
+        pass
 
     await message.answer(text='Ваша заявка успешно принята.', reply_markup=markup)
-    await state.clear()
+
+@dp.callback_query(F.data.startswith('quickReply_'))
+async def quickReply(callback: types.CallbackQuery, state: FSMContext):
+    markup = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text='Отмена', callback_data='back')]
+        ])
+
+    bidId = callback.data.removeprefix('quickReply_')
+
+    conn = sqlite3.connect('database.sql')
+    cur = conn.cursor()
+    cur.execute('SELECT user_tg_id FROM bid WHERE id = ?', (bidId,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not row:
+        await callback.answer('Заявка не найдена (возможно, уже закрыта).', show_alert=True)
+        return
+
+    await state.update_data(targerUserId=int(row[0]), bidId=bidId)
+    await state.set_state(ReplyState.waitingText)
+    await callback.message.answer(text='Текст ответа:', reply_markup=markup)
+    await callback.answer()
 
 @dp.callback_query(F.data == 'back')
 async def backToMenu(callback: types.CallbackQuery, state: FSMContext):
